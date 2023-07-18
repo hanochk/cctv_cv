@@ -90,7 +90,7 @@ image.save(os.path.join(result_path, os.path.basename(url)))
 
 """
 
-# filenames = glob.glob(path + '/**/*.jpg', recursive=True)
+# filenames = glob.glob(image_path + '/**/*.jpg', recursive=True)
 # print(filenames)
 
 
