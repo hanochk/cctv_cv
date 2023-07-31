@@ -22,13 +22,72 @@ import numpy as np
 import random
 import argparse
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, MaskRCNN_ResNet50_FPN_Weights
-from image_utils import download_image_file, draw_bounding_box_on_image
+from cctv_cv.image_utils import download_image_file, draw_bounding_box_on_image, bb_intersection_over_union
+
 # from ..obj_det_utils.dataset import LoadImages, LoadStreams
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
 from cctv_cv.obj_det_utils.DemoDataset import LoadImages, LoadStreams
+def flatten(lst): return [x for l in lst for x in l]
 
+def remove_from_list_by_index_safe_from_tail(indexes, my_list):
+    for index in sorted(indexes, reverse=True):
+        del my_list[index]
+    return my_list
+
+import torch
+import torchvision
+from torch import Tensor
+from torchvision.extension import _assert_has_ops
+
+def _batched_nms_coordinate_trick(
+    boxes: Tensor,
+    scores: Tensor,
+    idxs: Tensor,
+    iou_threshold: float,
+) -> Tensor:
+    # strategy: in order to perform NMS independently per class,
+    # we add an offset to all the boxes. The offset is dependent
+    # only on the class idx, and is large enough so that boxes
+    # from different classes do not overlap
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64, device=boxes.device)
+    max_coordinate = boxes.max()
+    offsets = idxs.to(boxes) * (max_coordinate + torch.tensor(1).to(boxes))
+    boxes_for_nms = boxes + offsets[:, None]
+    keep = nms(boxes_for_nms, scores, iou_threshold)
+    return keep
+
+def nms(boxes: Tensor, scores: Tensor, iou_threshold: float) -> Tensor:
+    """
+    Performs non-maximum suppression (NMS) on the boxes according
+    to their intersection-over-union (IoU).
+
+    NMS iteratively removes lower scoring boxes which have an
+    IoU greater than iou_threshold with another (higher scoring)
+    box.
+
+    If multiple boxes have the exact same score and satisfy the IoU
+    criterion with respect to a reference box, the selected box is
+    not guaranteed to be the same between CPU and GPU. This is similar
+    to the behavior of argsort in PyTorch when repeated values are present.
+
+    Args:
+        boxes (Tensor[N, 4])): boxes to perform NMS on. They
+            are expected to be in ``(x1, y1, x2, y2)`` format with ``0 <= x1 < x2`` and
+            ``0 <= y1 < y2``.
+        scores (Tensor[N]): scores for each one of the boxes
+        iou_threshold (float): discards all overlapping boxes with IoU > iou_threshold
+
+    Returns:
+        Tensor: int64 tensor with the indices of the elements that have been kept
+        by NMS, sorted in decreasing order of scores
+    """
+    # if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+    #     _log_api_usage_once(nms)
+    _assert_has_ops()
+    return torch.ops.torchvision.nms(boxes, scores, iou_threshold)
 
 
 class Dataset_cctv(torch.utils.data.Dataset):
@@ -59,7 +118,14 @@ COCO_INSTANCE_CATEGORY_NAMES = [
     'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
     'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
- 
+
+mrcnn_det_vehicle_classes = [COCO_INSTANCE_CATEGORY_NAMES[2], COCO_INSTANCE_CATEGORY_NAMES[3] ,COCO_INSTANCE_CATEGORY_NAMES[4],
+                                        COCO_INSTANCE_CATEGORY_NAMES[6], COCO_INSTANCE_CATEGORY_NAMES[8]]
+
+open_vocab_map = {'vehicle':["car", "truck", "fire truck", "motorcycle", "scooter", "bus", "moped"]}
+
+expert_detector_map = {"vehicle":mrcnn_det_vehicle_classes, "person" :"person"}
+
 def get_prediction(model, img, device, threshold=0.1):
   
   transform = T.Compose([T.ToTensor()]) # TODO where is the image normalization according to ImageNet ? 
@@ -74,7 +140,7 @@ def get_prediction(model, img, device, threshold=0.1):
   masks = masks[:pred_t+1]
   pred_boxes = pred_boxes[:pred_t+1]
   pred_class = pred_class[:pred_t+1]
-  return masks, pred_boxes, pred_class
+  return masks, pred_boxes, pred_class, pred_score
 
 def random_colour_masks(image):
     colours = [[0, 255, 0],[0, 0, 255],[255, 0, 0],[0, 255, 255],[255, 255, 0],[255, 0, 255],[80, 70, 180],[250, 80, 190],[245, 145, 50],[70, 150, 250],[50, 190, 190]]
@@ -94,15 +160,196 @@ def instance_segmentation_api(img_path, masks, boxes, pred_cls, rect_th=3, text_
         img = cv2.addWeighted(img, 1, rgb_mask, 0.5, 0)
         cv2.rectangle(img, tuple([int(bb) for bb in boxes[i][0]]), tuple([int(bb) for bb in boxes[i][1]]) , color=(0, 255, 0), thickness=rect_th)
         cv2.putText(img,pred_cls[i], tuple([int(bb) for bb in boxes[i][0]]), cv2.FONT_HERSHEY_SIMPLEX, text_size, (0,255,0),thickness=text_th)
-    plt.figure(figsize=(20,30))
+    plt.figure()
     plt.imshow(img)
-    plt.xticks([])
-    plt.yticks([])
+    plt.xticks()
+    plt.yticks()
     plt.show()
     return plt
-# masks, pred_boxes, pred_class = get_prediction(img_path=image_location, device=device)
 
-def detect(opt):
+def plot_detection_over_image(img_path, boxes, pred_cls, rect_th=3, text_size=3, text_th=3):
+
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    for i in range(len(boxes)):
+        # rgb_mask = random_colour_masks(masks[i])
+        # img = cv2.addWeighted(img, 1, rgb_mask, 0.5, 0)
+        cv2.rectangle(img, tuple([int(bb) for bb in boxes[i][0]]), tuple([int(bb) for bb in boxes[i][1]]) , color=(0, 255, 0), thickness=rect_th)
+        cv2.putText(img,pred_cls[i], tuple([int(bb) for bb in boxes[i][0]]), cv2.FONT_HERSHEY_SIMPLEX, text_size, (0,255,0),thickness=text_th)
+    plt.figure()
+    plt.imshow(img)
+    # plt.xticks([])
+    # plt.yticks([])
+    plt.show()
+    return plt
+
+# masks, pred_boxes, pred_class, pred_score = get_prediction(img_path=image_location, device=device)
+class MrcnnDet():
+    def __init__(self, device:str =''):
+        self.model_str = 'MaskRCNN_ResNet50_FPN_V2_Weights'
+        if not(device):
+            self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')  
+        # self.box_nms_thresh = 0.5
+        self.threshold = 0.4
+        self.box_nms_thresh = 0.55 #0.7 # defualt
+        # self.model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_V2_Weights)#(weights="DEFAULT")#pretrained=True)#(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+        self.model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_V2_Weights, 
+                                                                         box_nms_thresh=self.box_nms_thresh)#(weights="DEFAULT")#pretrained=True)#(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+        self.model.to(self.device)
+        
+    def detect(self,img):
+        with torch.no_grad():
+            self.model.eval()
+            masks, boxes, pred_cls, pred_score = get_prediction(model=self.model, img=img, 
+                                                    device=self.device, threshold=self.threshold)
+        return masks, boxes, pred_cls, pred_score
+        
+def detection_fusion(image_url: str, owl_vit_detections: list, nms_classes: list, 
+                     owl_objects_map:list, expert_det_det, iou_th:float = 0.35, plot_fig=True):
+    # image = Image.open(image_url).convert('RGB')
+    assert(iou_th<=1)
+    local_temp_path = "/tmp/file.{}".format(os.path.basename(image_url).split('.')[-1])
+    
+    urllib.request.urlretrieve(image_url, local_temp_path)
+    
+    image = Image.open(local_temp_path).convert('RGB')
+    masks , expert_det_boxes, expert_det_pred_cls, expert_det_pred_score = expert_det_det.detect(image)   
+    if plot_fig:
+        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
+        plt = instance_segmentation_api(img_path=local_temp_path, masks=masks, boxes=expert_det_boxes, pred_cls=expert_det_pred_cls)# just fpr plotting
+        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' \
+                    + str(os.path.basename(image_url).split('.')[0]) +str(expert_det_det.threshold) + '_nms_' + \
+                    str(expert_det_det.box_nms_thresh) + '_mrcnn_' +os.path.basename(local_temp_path)), dpi=300)
+        plt.close()
+    
+    
+    if plot_fig:
+        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
+        bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+        pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+        if 0:
+            # th = 200
+            # owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th and flatten(bb)[3]<th]
+            th_up = 600
+            th_dn = 100
+            owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
+            pred_cls = [it[1]  for it in owl_vit_filt_detections]
+            bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+            
+        plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                        pred_cls=pred_cls)# just fpr plotting
+        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' \
+                    + str(os.path.basename(image_url).split('.')[0]) + \
+                    str(expert_det_det.threshold) + '_nms_' + \
+                    str(expert_det_det.box_nms_thresh) + '_owl_vit_' +os.path.basename(local_temp_path)), dpi=300)
+        plt.close()
+        # sorted([bb_intersection_over_union(flatten(y), flatten(x)) for x in bboxes for y in bboxes])[::-1]
+        # np.percentile([np.sum(np.power(np.array(x[0])-np.array(x[1]), 2)) for x in bboxes],99)
+
+        
+    # all_owl_vit_detections = list()
+    # for elem in owl_vit_detections:
+    #     owlvit_cls = elem[0]
+    #     owlvit_box = elem[1]
+    #     owlvit_score = elem[2]
+    
+    
+    # expert_det_th = 0.8
+    # for bbox_mrcnn, cls_mrcnn, pred_score_mrcnn in zip (expert_det_boxes, expert_det_pred_cls, expert_det_pred_score):
+    #     all_expert_det_boxes_same_class = [bbox for x, bbox in zip(expert_det_pred_cls, expert_det_boxes) if x==cls_mrcnn]
+    #     iou = [bb_intersection_over_union(flatten(bbox_mrcnn), flatten(x)) for x in all_expert_det_boxes_same_class]
+    #     iou_sorted = sorted(iou)[::-1][1:]
+    #     ovlp_expert_det = [x > expert_det_th for x in sorted(iou)[::-1][1:]]
+    #     if any(ovlp_expert_det):
+    #         print(iou_sorted)
+    # seeking expert_det overelapped with owl 
+    all_expert_det_new_obj = list()
+    for bbox_mrcnn, cls_mrcnn, pred_score_mrcnn in zip (expert_det_boxes, expert_det_pred_cls, expert_det_pred_score):
+        if cls_mrcnn in nms_classes: # to do understand the mapping of nms_classes to expert_detector_map
+            class_category_lemma = [k for k,v in expert_detector_map.items() if cls_mrcnn in v][0]
+            # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
+            # Use mapped open_vocab_map since sometimes OWL classification is wrong in specific but it is still vehicle 
+            # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
+            # If owl vit class group/lemma is one one of the all expert_det related classes overcome miscalssification preventing NMSing 
+            owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] in expert_detector_map[class_category_lemma]]
+            if bool(owl_vit_detections_expert_det_cls_inx):
+                all_iou = list()
+                for inx in owl_vit_detections_expert_det_cls_inx:
+                    cls_owlvit, bbox_owlvit, score  =  owl_vit_detections[inx]
+                    iou = bb_intersection_over_union(flatten(bbox_mrcnn), bbox_owlvit)
+                    area_bbox_owlvit = (bbox_owlvit[0] - bbox_owlvit[2])*(bbox_owlvit[1] - bbox_owlvit[3])
+                    all_iou.append((inx, iou))
+                ovrlap_bbox_iou = [(inx, iou) for ix, (inx, iou) in enumerate(all_iou) if iou>iou_th]
+                if ovrlap_bbox_iou: # if there are overlapped boxeds with detector expert
+    # Check if OWL unique classes are the same else take MRCNN
+                    ovlp_cls_owl = [owl_vit_detections[ele[0]][0] for ele in ovrlap_bbox_iou]
+                    cls_fin = cls_mrcnn
+                    if ovlp_cls_owl.count(ovlp_cls_owl [0]) == len(ovlp_cls_owl): # only if classes identical
+                        # REmove the overlapped classes from owl list 
+                        cls_fin = ovlp_cls_owl[0]
+                        score = np.array(([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])).mean()
+
+                    else:
+                        most_likely_owl_class_obj = np.argmax([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])
+                        cls_fin = ovlp_cls_owl[most_likely_owl_class_obj]
+                        score = [owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou][most_likely_owl_class_obj]
+                    remove_from_list_by_index_safe_from_tail(indexes=[ele[0] for ele in ovrlap_bbox_iou], 
+                                                            my_list=owl_vit_detections)
+                    
+                else: # new object to the owl
+                    score = pred_score_mrcnn
+            else:
+                print("expert det added class/detection ")
+                cls_fin = cls_mrcnn
+                score = pred_score_mrcnn
+                
+            owl_vit_detections.append([cls_fin, flatten(bbox_mrcnn), score])
+            # all_expert_det_new_obj.append([cls_fin, flatten(bbox_mrcnn), score])
+    
+    # owl_vit_detections.extend(all_expert_det_new_obj)
+                
+    if plot_fig:
+        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
+        bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+        pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+        if 0:
+            th_up = 600
+            th_dn = 100
+            owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
+            pred_cls = [it[1]  for it in owl_vit_filt_detections]
+            bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+        
+        plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                        pred_cls=pred_cls)# just fpr plotting
+        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' + \
+                    str(os.path.basename(image_url).split('.')[0]) + \
+                    str(expert_det_det.threshold) + '_nms_' + \
+                    str(expert_det_det.box_nms_thresh) + '_owl_vit_merge_mrcnn_iou_vit_mrcnn_' + \
+                    str(iou_th) + '_' + \
+                    os.path.basename(local_temp_path)), dpi=300)
+        plt.close()
+
+
+    pass
+        
+def detect(img):
+    with torch.no_grad():
+        model_str = 'MaskRCNN_ResNet50_FPN_V2_Weights'
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')  
+        box_nms_thresh = 0.5
+        threshold = 0.2
+        model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_V2_Weights, box_nms_thresh=box_nms_thresh)#(weights="DEFAULT")#pretrained=True)#(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+        model.to(device)
+        model.eval()
+        # x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+        # predictions = model(x)
+        method = 'single_image'
+        
+        # plt = instance_segmentation_api(img=img, device=device, threshold=threshold)
+        masks, boxes, pred_cls, pred_score = get_prediction(model=model, img=img, device=device, threshold=threshold)
+    return masks, boxes, pred_cls
+
+def main(opt):
     dataset = Dataset_cctv()
 
     model_str = 'MaskRCNN_ResNet50_FPN_V2_Weights'
@@ -126,7 +373,7 @@ def detect(opt):
         for image_location in filenames:
             img = Image.open(image_location)
             # plt = instance_segmentation_api(img=img, device=device, threshold=threshold)
-            masks, boxes, pred_cls = get_prediction(model=model, img=img, device=device, threshold=threshold)
+            masks, boxes, pred_cls, pred_score = get_prediction(model=model, img=img, device=device, threshold=threshold)
             plt = instance_segmentation_api(img_path=image_location, masks=masks, boxes=boxes, pred_cls=pred_cls)# just fpr plotting
             plt.savefig(os.path.join(result_path, str(model_str)  + '_' + str(threshold) + '_nms' + str(box_nms_thresh) + '_' +os.path.basename(image_location)))
             plt.close()
@@ -154,7 +401,7 @@ def detect(opt):
             # img = transform(img).to(device)        
             # if img.ndimension() == 3:
             #     img = img.unsqueeze(0)
-            masks, boxes, pred_cls = get_prediction(model=model, img=img, device=device, threshold=threshold)
+            masks, boxes, pred_cls, pred_score = get_prediction(model=model, img=img, device=device, threshold=threshold)
 
             # img = cv2.imread(img_path)
             # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -214,7 +461,9 @@ if __name__ == '__main__':
     parser.add_argument('--update', action='store_true', help='update all models')
     opt = parser.parse_args()
     with torch.no_grad():
-        detect(opt)
+        main(opt)
+
+
 
 '''
 images = cv2.imread(image_location)
@@ -240,4 +489,10 @@ for i in range(len(pred[0]['masks'])):
         im2[:, :, 2][msk > 0.5] = random.randint(0, 255)
 cv2.imshow(str(scr), np.hstack([im,im2]))
 cv2.waitKey()
+
+
+_batched_nms_coordinate_trick(Tensor([flatten(x) for x in expert_det_boxes]), Tensor(expert_det_pred_score), torch.ones(1,len(expert_det_pred_score)).reshape(-1), 0.6)
+[x for x in owl_vit_detections if x[1][0]>800 and x[1][2]<1140 and x[1][1]>200 and x[1][3]<550]
+[owl_vit_detections[x] for x in owl_vit_detections_expert_det_cls_inx]
+[owl_vit_detections[x[0]] for x in ovrlap_bbox_iou]
 '''

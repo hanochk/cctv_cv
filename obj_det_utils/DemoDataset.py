@@ -15,8 +15,8 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 # from .obj_det_utils import clean_str
-from obj_det_utils.utils import clean_str
-from obj_det_utils.augmentations import letterbox_for_img
+from cctv_cv.obj_det_utils.utils import clean_str
+from cctv_cv.obj_det_utils.augmentations import letterbox_for_img
 
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
 vid_formats = ['.mov', '.avi', '.mp4', '.mpg', '.mpeg', '.m4v', '.wmv', '.mkv']
