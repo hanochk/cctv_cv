@@ -22,13 +22,27 @@ import numpy as np
 import random
 import argparse
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, MaskRCNN_ResNet50_FPN_Weights
-from cctv_cv.image_utils import download_image_file, draw_bounding_box_on_image, bb_intersection_over_union
+from scene_graph_builder.cctv_cvs.image_utils import download_image_file, draw_bounding_box_on_image, bb_intersection_over_union
+import torch
+import torchvision
+from torch import Tensor
+from torchvision.extension import _assert_has_ops
+
+import os, ssl, json
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ["http_proxy"] = "http://127.0.0.1:3128"
+os.environ["https_proxy"] = "http://127.0.0.1:3128"
+os.environ["ftp_proxy"] = "http://127.0.0.1:3128"
+os.environ["socks_proxy"] = "http://127.0.0.1:3128"
+os.environ["no_proxy"] = "localhost,127.0.0.0/8,10.0.0.0/8,192.168.2.0/24,7.182.10.178/24,100.95.135.187/24, 7.182.10.178:9000, 7.182.10.19"
+
 
 # from ..obj_det_utils.dataset import LoadImages, LoadStreams
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
-from cctv_cv.obj_det_utils.DemoDataset import LoadImages, LoadStreams
+from cctv_cvs.obj_det_utils.DemoDataset import LoadImages, LoadStreams
 def flatten(lst): return [x for l in lst for x in l]
 
 def remove_from_list_by_index_safe_from_tail(indexes, my_list):
@@ -36,10 +50,10 @@ def remove_from_list_by_index_safe_from_tail(indexes, my_list):
         del my_list[index]
     return my_list
 
-import torch
-import torchvision
-from torch import Tensor
-from torchvision.extension import _assert_has_ops
+
+
+from scene_graph_builder.objects_vocab_v02 import *
+owl_objects_map = ALL_OBJECTS
 
 def _batched_nms_coordinate_trick(
     boxes: Tensor,
@@ -167,14 +181,14 @@ def instance_segmentation_api(img_path, masks, boxes, pred_cls, rect_th=3, text_
     plt.show()
     return plt
 
-def plot_detection_over_image(img_path, boxes, pred_cls, rect_th=3, text_size=3, text_th=3):
+def plot_detection_over_image(img_path, boxes, pred_cls, rect_th=3, text_size=3, text_th=3, color_box=(0, 255, 0)):
 
     img = cv2.imread(img_path)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     for i in range(len(boxes)):
         # rgb_mask = random_colour_masks(masks[i])
         # img = cv2.addWeighted(img, 1, rgb_mask, 0.5, 0)
-        cv2.rectangle(img, tuple([int(bb) for bb in boxes[i][0]]), tuple([int(bb) for bb in boxes[i][1]]) , color=(0, 255, 0), thickness=rect_th)
+        cv2.rectangle(img, tuple([int(bb) for bb in boxes[i][0]]), tuple([int(bb) for bb in boxes[i][1]]) , color=color_box, thickness=rect_th)
         cv2.putText(img,pred_cls[i], tuple([int(bb) for bb in boxes[i][0]]), cv2.FONT_HERSHEY_SIMPLEX, text_size, (0,255,0),thickness=text_th)
     plt.figure()
     plt.imshow(img)
@@ -203,133 +217,225 @@ class MrcnnDet():
             masks, boxes, pred_cls, pred_score = get_prediction(model=self.model, img=img, 
                                                     device=self.device, threshold=self.threshold)
         return masks, boxes, pred_cls, pred_score
-        
-def detection_fusion(image_url: str, owl_vit_detections: list, nms_classes: list, 
-                     owl_objects_map:list, expert_det_det, iou_th:float = 0.35, plot_fig=True):
+        # nms_classes=mrcnn_det_vehicle_classes
+expert_det_det = MrcnnDet()
+
+def detection_fusion(image_url: str, owl_vit_detections: list,  
+                    #  owl_objects_map:list, 
+                    #  expert_det_det, 
+                     iou_th:float = 0.35, 
+                     nms_classes: list=mrcnn_det_vehicle_classes, iou_th_all_owl:float = 0.5,  
+                     nms_owl_all_classes: bool=True, plot_fig: bool=True):
     # image = Image.open(image_url).convert('RGB')
+    start = time.time()
+
     assert(iou_th<=1)
     local_temp_path = "/tmp/file.{}".format(os.path.basename(image_url).split('.')[-1])
-    
+    stop1 = time.time()
+    image = Image.open(local_temp_path).convert('RGB')    
     urllib.request.urlretrieve(image_url, local_temp_path)
     
     image = Image.open(local_temp_path).convert('RGB')
-    masks , expert_det_boxes, expert_det_pred_cls, expert_det_pred_score = expert_det_det.detect(image)   
     if plot_fig:
-        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
-        plt = instance_segmentation_api(img_path=local_temp_path, masks=masks, boxes=expert_det_boxes, pred_cls=expert_det_pred_cls)# just fpr plotting
-        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' \
-                    + str(os.path.basename(image_url).split('.')[0]) +str(expert_det_det.threshold) + '_nms_' + \
-                    str(expert_det_det.box_nms_thresh) + '_mrcnn_' +os.path.basename(local_temp_path)), dpi=300)
-        plt.close()
+        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cvs'
     
-    
-    if plot_fig:
-        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
-        bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
-        pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
-        if 0:
-            # th = 200
-            # owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th and flatten(bb)[3]<th]
-            th_up = 600
-            th_dn = 100
-            owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
-            pred_cls = [it[1]  for it in owl_vit_filt_detections]
-            bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+    if nms_owl_all_classes:
+        stop2 = time.time()
+        all_pred_cls = [it[0]  for it in owl_vit_detections]
+        all_pred_score = [it[2]  for it in owl_vit_detections]
+        # non_nms_cls_lemma = np.unique([owl_objects_map[x] for x in all_pred_cls if owl_objects_map[x] not in nms_classes])
+        non_nms_cls_lemma = np.unique([owl_objects_map[x] for x in all_pred_cls])
+        all_bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections ]
+        
+        # cls_ind = np.arange(non_nms_cls_lemma.shape[0])
+        all_pred_lemma_index_dict = dict()
+        all_pred_lemma_index_dict = {x:ix for ix, x in enumerate(non_nms_cls_lemma)}
+
+        # [all_pred_lemma_index_dict[owl_objects_map[x]] = np.where(non_nms_cls_lemma==x)[0] for x in all_pred_cls if owl_objects_map[x] not in nms_classes]
+        
+        keep = _batched_nms_coordinate_trick(Tensor([flatten(x) for x in all_bboxes]), 
+                                      Tensor(all_pred_score), 
+                                      idxs=Tensor([all_pred_lemma_index_dict[owl_objects_map[x]] for x in all_pred_cls]), 
+                                      iou_threshold=iou_th_all_owl)
+        
+        if plot_fig:
+            nms_diff = set(np.arange(len(all_pred_cls))) - set(keep.numpy())
+            nmsed_cls = [owl_vit_detections[x][0] for x in nms_diff]
+            replicated_owl = [x for x in owl_vit_detections if x[0] in [owl_objects_map[y] for y in nmsed_cls]]
+            bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in replicated_owl ]
+            pred_cls = [it[0]  for it in replicated_owl]
+            plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                            pred_cls=pred_cls)# just fpr plotting
             
-        plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
-                                        pred_cls=pred_cls)# just fpr plotting
-        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' \
-                    + str(os.path.basename(image_url).split('.')[0]) + \
-                    str(expert_det_det.threshold) + '_nms_' + \
-                    str(expert_det_det.box_nms_thresh) + '_owl_vit_' +os.path.basename(local_temp_path)), dpi=300)
-        plt.close()
-        # sorted([bb_intersection_over_union(flatten(y), flatten(x)) for x in bboxes for y in bboxes])[::-1]
-        # np.percentile([np.sum(np.power(np.array(x[0])-np.array(x[1]), 2)) for x in bboxes],99)
+            plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' +\
+                        str(os.path.basename(image_url).split('.')[0]) + '_' + \
+                        str(expert_det_det.threshold) + '_nms_' + \
+                        str(expert_det_det.box_nms_thresh) + '_nms_owl_vit_classes' +os.path.basename(local_temp_path)), dpi=300)
+            plt.close()
+            
+        owl_vit_detections = [owl_vit_detections[x] for x in keep]
+        stop3 = time.time()
+        print('nms_owl_all_classes: {:6f} seconds'.format(stop3 - stop2)) 
 
+        if plot_fig:# plot the replicated objects after NMsed
+            replicated_owl = [x for x in owl_vit_detections if x[0] in [owl_objects_map[y] for y in nmsed_cls]]
+            bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in replicated_owl ]
+            pred_cls = [it[0]  for it in replicated_owl]
+            color_box=(255, 0, 0)
+            plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                            pred_cls=pred_cls, color_box=color_box)# just fpr plotting
+            
+            plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' +\
+                        str(os.path.basename(image_url).split('.')[0]) + '_' + \
+                        str(expert_det_det.threshold) + '_nms_' + \
+                        str(expert_det_det.box_nms_thresh) + '_nms_owl_vit_classes_after_nms' +os.path.basename(local_temp_path)), dpi=300)
+            plt.close()
+    
+    try:
+        masks , expert_det_boxes, expert_det_pred_cls, expert_det_pred_score = expert_det_det.detect(image)
+           
+        if plot_fig:
+            # result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cvs'
+            if 0:
+                expert_det_pred_cls = [''] * len(expert_det_pred_cls)
+            plt = instance_segmentation_api(img_path=local_temp_path, masks=masks, 
+                                            boxes=expert_det_boxes, pred_cls=expert_det_pred_cls)# just fpr plotting
+            
+            plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' +\
+                        str(os.path.basename(image_url).split('.')[0]) + '_' + \
+                        str(expert_det_det.threshold) + '_nms_' + \
+                        str(expert_det_det.box_nms_thresh) + '_mrcnn_' +os.path.basename(local_temp_path)), dpi=300)
+            plt.close()
         
-    # all_owl_vit_detections = list()
-    # for elem in owl_vit_detections:
-    #     owlvit_cls = elem[0]
-    #     owlvit_box = elem[1]
-    #     owlvit_score = elem[2]
-    
-    
-    # expert_det_th = 0.8
-    # for bbox_mrcnn, cls_mrcnn, pred_score_mrcnn in zip (expert_det_boxes, expert_det_pred_cls, expert_det_pred_score):
-    #     all_expert_det_boxes_same_class = [bbox for x, bbox in zip(expert_det_pred_cls, expert_det_boxes) if x==cls_mrcnn]
-    #     iou = [bb_intersection_over_union(flatten(bbox_mrcnn), flatten(x)) for x in all_expert_det_boxes_same_class]
-    #     iou_sorted = sorted(iou)[::-1][1:]
-    #     ovlp_expert_det = [x > expert_det_th for x in sorted(iou)[::-1][1:]]
-    #     if any(ovlp_expert_det):
-    #         print(iou_sorted)
-    # seeking expert_det overelapped with owl 
-    all_expert_det_new_obj = list()
-    for bbox_mrcnn, cls_mrcnn, pred_score_mrcnn in zip (expert_det_boxes, expert_det_pred_cls, expert_det_pred_score):
-        if cls_mrcnn in nms_classes: # to do understand the mapping of nms_classes to expert_detector_map
-            class_category_lemma = [k for k,v in expert_detector_map.items() if cls_mrcnn in v][0]
-            # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
-            # Use mapped open_vocab_map since sometimes OWL classification is wrong in specific but it is still vehicle 
-            # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
-            # If owl vit class group/lemma is one one of the all expert_det related classes overcome miscalssification preventing NMSing 
-            owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] in expert_detector_map[class_category_lemma]]
-            if bool(owl_vit_detections_expert_det_cls_inx):
-                all_iou = list()
-                for inx in owl_vit_detections_expert_det_cls_inx:
-                    cls_owlvit, bbox_owlvit, score  =  owl_vit_detections[inx]
-                    iou = bb_intersection_over_union(flatten(bbox_mrcnn), bbox_owlvit)
-                    area_bbox_owlvit = (bbox_owlvit[0] - bbox_owlvit[2])*(bbox_owlvit[1] - bbox_owlvit[3])
-                    all_iou.append((inx, iou))
-                ovrlap_bbox_iou = [(inx, iou) for ix, (inx, iou) in enumerate(all_iou) if iou>iou_th]
-                if ovrlap_bbox_iou: # if there are overlapped boxeds with detector expert
-    # Check if OWL unique classes are the same else take MRCNN
-                    ovlp_cls_owl = [owl_vit_detections[ele[0]][0] for ele in ovrlap_bbox_iou]
-                    cls_fin = cls_mrcnn
-                    if ovlp_cls_owl.count(ovlp_cls_owl [0]) == len(ovlp_cls_owl): # only if classes identical
-                        # REmove the overlapped classes from owl list 
-                        cls_fin = ovlp_cls_owl[0]
-                        score = np.array(([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])).mean()
+        
+        if plot_fig:
+            result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cvs'
+            if 0:# all classes all boxes
+                bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections]
+                pred_cls = [it[0]  for it in owl_vit_detections]
+            else: # dedicated classes only!
+                bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+                pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+            if 1:
+                # th = 200
+                # owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th and flatten(bb)[3]<th]
+                th_up = 600
+                th_dn = 100
+                owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
+                pred_cls = [it[1]  for it in owl_vit_filt_detections]
+                bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+            if 1:# remove class name from bbox
+                pred_cls = [''] * len(pred_cls)
+                
+            plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                            pred_cls=pred_cls)# just fpr plotting
+            
+            plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' +\
+                        str(os.path.basename(image_url).split('.')[0]) + '_' + \
+                        str(expert_det_det.threshold) + '_nms_' + \
+                        str(expert_det_det.box_nms_thresh) + '_owl_vit_' +os.path.basename(local_temp_path)), dpi=300)
+            plt.close()
+            
+                
+            # [(ix, it)  for ix, it in enumerate(owl_vit_detections) if it[0] =='grill']
+        # seeking expert_det overelapped with owl 
+        class_category_lemma = [k for k,v in expert_detector_map.items() if nms_classes[0] in v][0]
+        num_el = len([it[0]  for it in owl_vit_detections if [k for k,v in open_vocab_map.items() if owl_objects_map[it[0]] in v] == [class_category_lemma]])
 
-                    else:
-                        most_likely_owl_class_obj = np.argmax([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])
-                        cls_fin = ovlp_cls_owl[most_likely_owl_class_obj]
-                        score = [owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou][most_likely_owl_class_obj]
-                    remove_from_list_by_index_safe_from_tail(indexes=[ele[0] for ele in ovrlap_bbox_iou], 
-                                                            my_list=owl_vit_detections)
+        print("Num of Given {} objects: {}".format(class_category_lemma, num_el))
+        
+        all_expert_det_new_obj = list()
+        for bbox_mrcnn, cls_mrcnn, pred_score_mrcnn in zip (expert_det_boxes, expert_det_pred_cls, expert_det_pred_score):
+            if cls_mrcnn in nms_classes: # to do understand the mapping of nms_classes to expert_detector_map
+                class_category_lemma = [k for k,v in expert_detector_map.items() if cls_mrcnn in v][0]
+                # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
+                # Use mapped open_vocab_map since sometimes OWL classification is wrong in specific but it is still vehicle 
+                # owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] == cls_mrcnn  ]
+                # If owl vit class group/lemma is one one of the all expert_det related classes overcome miscalssification preventing NMSing 
+                if 1:
+                    owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] in expert_detector_map[class_category_lemma]]
+                else:
+                    owl_vit_detections_expert_det_cls_inx = [ix for ix, obj in enumerate(owl_vit_detections) if [k for k,v in open_vocab_map.items() if owl_objects_map[obj[0]] in v] == [class_category_lemma]]
                     
-                else: # new object to the owl
+                if bool(owl_vit_detections_expert_det_cls_inx):
+                    all_iou = list()
+                    for inx in owl_vit_detections_expert_det_cls_inx:
+                        cls_owlvit, bbox_owlvit, score  =  owl_vit_detections[inx]
+                        iou = bb_intersection_over_union(flatten(bbox_mrcnn), bbox_owlvit)
+                        area_bbox_owlvit = (bbox_owlvit[0] - bbox_owlvit[2])*(bbox_owlvit[1] - bbox_owlvit[3])
+                        all_iou.append((inx, iou))
+                    ovrlap_bbox_iou = [(inx, iou) for ix, (inx, iou) in enumerate(all_iou) if iou>iou_th]
+                    if ovrlap_bbox_iou: # if there are overlapped boxeds with detector expert
+        # Check if OWL unique classes are the same else take MRCNN
+                        ovlp_cls_owl = [owl_vit_detections[ele[0]][0] for ele in ovrlap_bbox_iou]
+                        cls_fin = cls_mrcnn
+                        if ovlp_cls_owl.count(ovlp_cls_owl [0]) == len(ovlp_cls_owl): # only if classes identical
+                            # REmove the overlapped classes from owl list 
+                            cls_fin = ovlp_cls_owl[0]
+                            score = np.array(([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])).mean()
+
+                        else:
+                            most_likely_owl_class_obj = np.argmax([owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou])
+                            cls_fin = ovlp_cls_owl[most_likely_owl_class_obj]
+                            score = [owl_vit_detections[ele[0]][2] for ele in ovrlap_bbox_iou][most_likely_owl_class_obj]
+                        if plot_fig :
+                            print("-- index removed from owl list", [ele[0] for ele in ovrlap_bbox_iou], [owl_vit_detections[ele[0]] for ele in ovrlap_bbox_iou], len(owl_vit_detections))
+                        remove_from_list_by_index_safe_from_tail(indexes=[ele[0] for ele in ovrlap_bbox_iou], 
+                                                                my_list=owl_vit_detections)
+                        if plot_fig :
+                            print("--len  index removed from owl list", len(owl_vit_detections))
+                    else: # new object to the owl not overlapped 
+                        score = pred_score_mrcnn
+                        cls_fin = cls_mrcnn
+                else:
+                    print("expert det added class/detection ")
+                    cls_fin = cls_mrcnn
                     score = pred_score_mrcnn
-            else:
-                print("expert det added class/detection ")
-                cls_fin = cls_mrcnn
-                score = pred_score_mrcnn
-                
-            owl_vit_detections.append([cls_fin, flatten(bbox_mrcnn), score])
-            # all_expert_det_new_obj.append([cls_fin, flatten(bbox_mrcnn), score])
-    
-    # owl_vit_detections.extend(all_expert_det_new_obj)
-                
-    if plot_fig:
-        result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cv'
-        bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
-        pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
-        if 0:
-            th_up = 600
-            th_dn = 100
-            owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
-            pred_cls = [it[1]  for it in owl_vit_filt_detections]
-            bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+                    
+                # owl_vit_detections.append([cls_fin, flatten(bbox_mrcnn), score])
+                if plot_fig :
+                    print("++index added to owl list",[cls_fin, flatten(bbox_mrcnn), score], len(owl_vit_detections))
+
+                all_expert_det_new_obj.append([cls_fin, flatten(bbox_mrcnn), score]) # to appended to other list otherwise other obj will NMS other with the mfused stricker IOU threshold
         
-        plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
-                                        pred_cls=pred_cls)# just fpr plotting
-        plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' + \
-                    str(os.path.basename(image_url).split('.')[0]) + \
-                    str(expert_det_det.threshold) + '_nms_' + \
-                    str(expert_det_det.box_nms_thresh) + '_owl_vit_merge_mrcnn_iou_vit_mrcnn_' + \
-                    str(iou_th) + '_' + \
-                    os.path.basename(local_temp_path)), dpi=300)
-        plt.close()
+        owl_vit_detections.extend(all_expert_det_new_obj)
+                    
+        if plot_fig:
+            result_path = '/root/notebooks/vidarts_super_detector/vidarts_advanced/scene_graph_builder/cctv_cvs'
+            bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if [k for k,v in open_vocab_map.items() if owl_objects_map[it[0]] in v] == [class_category_lemma]]
+            # bboxes = [[(it[1][0], it[1][1]), (it[1][2], it[1][3])]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+            # [ix for ix, obj in enumerate(owl_vit_detections) if owl_objects_map[obj[0]] in expert_detector_map[class_category_lemma]]
+            [ix for ix, obj in enumerate(owl_vit_detections) if [k for k,v in open_vocab_map.items() if owl_objects_map[obj[0]] in v] == [class_category_lemma]]
+            num_el = len([it[0]  for it in owl_vit_detections if [k for k,v in open_vocab_map.items() if owl_objects_map[it[0]] in v] == [class_category_lemma]])
+
+            print("Num of fused {} objects: {}".format(class_category_lemma, num_el))
+            pred_cls = [it[0]  for it in owl_vit_detections if owl_objects_map[it[0]] in nms_classes]
+            if 0:
+                th_up = 600
+                th_dn = 100
+                owl_vit_filt_detections = [(bb, cls1) for bb, cls1 in zip(bboxes, pred_cls) if flatten(bb)[1]<th_up and flatten(bb)[3]<th_up and flatten(bb)[1]>th_dn and flatten(bb)[3]>th_dn]
+                pred_cls = [it[1]  for it in owl_vit_filt_detections]
+                bboxes = [[(it[0][0][0], it[0][0][1]), (it[0][1][0], it[0][1][1])]  for it in owl_vit_filt_detections]
+            if 1:
+                pred_cls = [''] * len(pred_cls)
+            plt = plot_detection_over_image(img_path=local_temp_path, boxes=bboxes, 
+                                            pred_cls=pred_cls)# just fpr plotting
+            plt.savefig(os.path.join(result_path, str(expert_det_det.model_str)  + '_' + \
+                        str(os.path.basename(image_url).split('.')[0]) + '_' + \
+                        str(expert_det_det.threshold) + '_nms_' + \
+                        str(expert_det_det.box_nms_thresh) + '_owl_vit_merge_mrcnn_iou_vit_mrcnn_' + \
+                        str(iou_th) + '_' + \
+                        os.path.basename(local_temp_path)), dpi=300)
+            plt.close()
+    except Exception as e:
+        print(e)
+        print("MRCNN Model failed probably a blackish image CAR detection/NMS is omitted but NMS for OwlVIt still applied !!!")
 
 
+    stop4 = time.time()
+    print('NMS lemma vehicle: {:6f} seconds'.format(stop4 - stop3)) 
+    print('all: {:6f} seconds'.format(stop4 - start)) 
+    
     pass
         
 def detect(img):
