@@ -34,7 +34,7 @@ owl_service = OwlVitService()
 
 # # Inputs
 url = "http://74.82.29.209:9000//datasets/cctv/cctv_examples2/congestion-1080p_0164.jpg"
-texts = [["A photo of a vehicle"]]
+texts = [["vehicle", "car", "van", "sedan", "truck"]]
 texts = json.dumps(texts)
 # texts = np.asarray(texts, dtype=np.object_)
 score_threshold = json.dumps(0.01)
@@ -46,6 +46,7 @@ print("Outputs: {}".format(outputs))
 vg_reshape_input = [1, 1]
 # np.percentile(all_bbox, 80) = 165437.6
 all_bbox = list()
+thresh = 0.1
 for item in outputs[0]:
     cls_obj = item[0]
     bbox = [int(x) for x in item[1]]
@@ -53,9 +54,8 @@ for item in outputs[0]:
 
     box_area = (bbox[2]- bbox[0]) *(bbox[3]- bbox[1])
     all_bbox.append(box_area)
-
-    if box_area < 165437 and sim_score>0.03: # and box_area < 200000:
-      print(sim_score)
+    if sim_score>thresh: # and box_area < 200000:   (1 or box_area < 165437) and 
+      print(sim_score, cls_obj)
       draw_bounding_box_on_image(image, bbox[1], bbox[0], bbox[3], bbox[2], 
                                 thickness=2, display_str_list='', use_normalized_coordinates=False)
 
@@ -71,7 +71,7 @@ for item in outputs[0]:
       
       draw.text(
           tuple([int(x) for x in (left + margin, text_bottom - text_height - margin)]),
-          str(sim_score) + '_' +str(box_area),
+          str(sim_score) + '_' + str(cls_obj) + '_' + str(box_area),
           fill='black',
           font=font)
 
@@ -79,7 +79,7 @@ for item in outputs[0]:
 if 0:
   plt.hist(all_bbox, bins=30)
   plt.savefig(os.path.join(result_path, 'hist_' +os.path.basename(url)))
-image.save(os.path.join(result_path, os.path.basename(url)))
+image.save(os.path.join(result_path, 'new_prompt_' + str(thresh) +'_' + os.path.basename(url)))
 
 # path = '/notebooks/dataset/cctv/cctv_examples2/traffic'
 """.git/

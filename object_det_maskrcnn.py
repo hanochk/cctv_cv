@@ -462,12 +462,27 @@ def main(opt):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')  
     box_nms_thresh = 0.5
     threshold = 0.2
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_V2_Weights, box_nms_thresh=box_nms_thresh)#(weights="DEFAULT")#pretrained=True)#(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+    
+    hybridnets = True
+    if hybridnets:
+        model = torch.hub.load('datvuthanh/hybridnets', 'hybridnets', pretrained=True)
+    else:
+        model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_V2_Weights, box_nms_thresh=box_nms_thresh)#(weights="DEFAULT")#pretrained=True)#(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
     model.to(device)
     model.eval()
+    
     # x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
     # predictions = model(x)
-    method = 'multi_image'
+    
+    if 0:
+        img = torch.randn(1,3,640,384)     
+        img = img.to(device)
+   
+        features, regression, classification, anchors, segmentation = model(img)        
+
+    
+    method = 'single_image' #'multi_image'
+
     result_path = '/notebooks/dataset/cctv/mask_rcnn'#'/notebooks/cctv_cv' #os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
     # url = "http://74.82.29.209:9000//datasets/cctv/cctv_examples2/congestion-1080p_0164.jpg"
@@ -478,6 +493,14 @@ def main(opt):
         filenames = glob.glob(image_path + '/**/*.jpg', recursive=True)
         for image_location in filenames:
             img = Image.open(image_location)
+
+            if hybridnets:
+                transform = T.Compose([T.Rezise((640,384)), T.ToTensor()]) # TODO where is the image normalization according to ImageNet ? 
+                img = transform(img).unsqueeze(0)
+                img = img.to(device)
+
+                features, regression, classification, anchors, segmentation = model(img)        
+
             # plt = instance_segmentation_api(img=img, device=device, threshold=threshold)
             masks, boxes, pred_cls, pred_score = get_prediction(model=model, img=img, device=device, threshold=threshold)
             plt = instance_segmentation_api(img_path=image_location, masks=masks, boxes=boxes, pred_cls=pred_cls)# just fpr plotting
